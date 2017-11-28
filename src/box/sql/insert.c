@@ -341,6 +341,9 @@ sqlite3Insert(Parse * pParse,	/* Parser context */
 	int regData;		/* register holding first column to insert */
 	int *aRegIdx = 0;	/* One register allocated to each index */
 
+	u8 isReplace;	/* Set to true if constraints may cause a replace */
+	u8 isUseSeek;	/* True to use OPFLAG_SEEKRESULT */
+
 #ifndef SQLITE_OMIT_TRIGGER
 	int isView;		/* True if attempting to insert into a view */
 	Trigger *pTrigger;	/* List of triggers on pTab, if required */
@@ -661,67 +664,10 @@ sqlite3Insert(Parse * pParse,	/* Parser context */
 		VdbeCoverage(v);
 	}
 
-	/* Run the BEFORE and INSTEAD OF triggers, if there are any
-	 */
-	endOfLoop = sqlite3VdbeMakeLabel(v);
-	if (tmask & TRIGGER_BEFORE) {
-		int regCols = sqlite3GetTempRange(pParse, pTab->nCol + 1);
-
-		/* Create the new column data
-		 */
-		for (i = j = 0; i < pTab->nCol; i++) {
-			if (pColumn) {
-				for (j = 0; j < pColumn->nId; j++) {
-					if (pColumn->a[j].idx == i)
-						break;
-				}
-			}
-			if ((!useTempTable && !pList)
-			    || (pColumn && j >= pColumn->nId)
-			    || (pColumn == 0
-				&& IsOrdinaryHiddenColumn(&pTab->aCol[i]))) {
-				if (i == pTab->iAutoIncPKey)
-					sqlite3VdbeAddOp2(v, OP_Integer, -1,
-							  regCols + i + 1);
-				else
-					sqlite3ExprCode(pParse,
-							pTab->aCol[i].pDflt,
-							regCols + i + 1);
-			} else if (useTempTable) {
-				sqlite3VdbeAddOp3(v, OP_Column, srcTab, j,
-						  regCols + i + 1);
-			} else {
-				assert(pSelect == 0);	/* Otherwise useTempTable is true */
-				sqlite3ExprCodeAndCache(pParse,
-							pList->a[j].pExpr,
-							regCols + i + 1);
-			}
-			if (pColumn == 0
-			    && !IsOrdinaryHiddenColumn(&pTab->aCol[i]))
-				j++;
-		}
-
-		/* If this is an INSERT on a view with an INSTEAD OF INSERT trigger,
-		 * do not attempt any conversions before assembling the record.
-		 * If this is a real table, attempt conversions as required by the
-		 * table column affinities.
-		 */
-		if (!isView) {
-			sqlite3TableAffinity(v, pTab, regCols + 1);
-		}
-
-		/* Fire BEFORE or INSTEAD OF triggers */
-		sqlite3CodeRowTrigger(pParse, pTrigger, TK_INSERT, 0,
-				      TRIGGER_BEFORE, pTab,
-				      regCols - pTab->nCol - 1, onError,
-				      endOfLoop);
-
-		sqlite3ReleaseTempRange(pParse, regCols, pTab->nCol + 1);
-	}
-
 	/* Compute the content of the next row to insert into a range of
 	 * registers beginning at regIns.
 	 */
+	endOfLoop = sqlite3VdbeMakeLabel(v);
 	if (!isView) {
 		if (ipkColumn >= 0) {
 			if (useTempTable) {
@@ -836,39 +782,105 @@ sqlite3Insert(Parse * pParse,	/* Parser context */
 						iRegStore);
 			}
 		}
-
-		/* Generate code to check constraints and generate index keys
-		   and do the insertion.
-		 */
-		int isReplace;	/* Set to true if constraints may cause a replace */
-		int bUseSeek;	/* True to use OPFLAG_SEEKRESULT */
 		sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur,
 						iIdxCur, regIns, 0,
 						ipkColumn >= 0, onError,
-						endOfLoop, &isReplace, 0);
+						endOfLoop, &isReplace, 0,
+						CONSTRAINT_REPLACE_MODE);
+	}
+
+	/* Run the BEFORE and INSTEAD OF triggers, if there are any. */
+	if (tmask & TRIGGER_BEFORE) {
+		int regCols = sqlite3GetTempRange(pParse, pTab->nCol + 1);
+
+		/* Create the new column data
+		 */
+		for (i = j = 0; i < pTab->nCol; i++) {
+			if (pColumn) {
+				for (j = 0; j < pColumn->nId; j++) {
+					if (pColumn->a[j].idx == i)
+						break;
+				}
+			}
+			if ((!useTempTable && !pList)
+			    || (pColumn && j >= pColumn->nId)
+			    || (pColumn == 0
+				&& IsOrdinaryHiddenColumn(&pTab->aCol[i]))) {
+				if (i == pTab->iAutoIncPKey)
+					sqlite3VdbeAddOp2(v, OP_Integer, -1,
+							  regCols + i + 1);
+				else
+					sqlite3ExprCode(pParse,
+							pTab->aCol[i].pDflt,
+							regCols + i + 1);
+			} else if (useTempTable) {
+				sqlite3VdbeAddOp3(v, OP_Column, srcTab, j,
+						  regCols + i + 1);
+			} else {
+				/* Otherwise useTempTable is true */
+				assert(pSelect == 0);
+				sqlite3ExprCodeAndCache(pParse,
+							pList->a[j].pExpr,
+							regCols + i + 1);
+			}
+			if (pColumn == 0
+			    && !IsOrdinaryHiddenColumn(&pTab->aCol[i]))
+				j++;
+		}
+
+		/* If this is an INSERT on a view with an INSTEAD OF INSERT
+		 * trigger, do not attempt any conversions before
+		 * assembling the record.
+		 * If this is a real table, attempt conversions
+		 * as required by the table column affinities.
+		 */
+		if (!isView) {
+			sqlite3TableAffinity(v, pTab, regCols + 1);
+		}
+
+		/* Fire BEFORE or INSTEAD OF triggers */
+		sqlite3CodeRowTrigger(pParse, pTrigger, TK_INSERT, 0,
+				      TRIGGER_BEFORE, pTab,
+				      regCols - pTab->nCol - 1, onError,
+				      endOfLoop);
+
+		sqlite3ReleaseTempRange(pParse, regCols, pTab->nCol + 1);
+	}
+
+	/* Update the count of rows that are inserted. */
+	if ((user_session->sql_flags & SQLITE_CountRows) != 0) {
+		sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+	}
+
+	if (!isView) {
+		/* Set the OPFLAG_USESEEKRESULT flag if either (a) there are
+		 * no REPLACE constraints or (b) there are no triggers
+		 * and this table is not a
+		 * parent table in a foreign key constraint. It is safe
+		 * to set the flag in the second case as if any
+		 * REPLACE constraint is hit, an OP_Delete or OP_IdxDelete
+		 * instruction will be executed on each cursor that is
+		 * disturbed. And these instructions both clear the
+		 * VdbeCursor.seekResult variable, disabling
+		 * the OPFLAG_USESEEKRESULT functionality.
+		 */
+
+		/* Generate code to check constraints and generate index keys
+		 * and do the insertion.
+		 */
+		sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur,
+						iIdxCur, regIns, 0,
+						ipkColumn >= 0, onError,
+						endOfLoop, &isReplace, 0,
+						CONSTRAINT_DEFAULT_MODE);
 		sqlite3FkCheck(pParse, pTab, 0, regIns, 0);
 
-		/* Set the OPFLAG_USESEEKRESULT flag if either (a) there are no REPLACE
-		 * constraints or (b) there are no triggers and this table is not a
-		 * parent table in a foreign key constraint. It is safe to set the
-		 * flag in the second case as if any REPLACE constraint is hit, an
-		 * OP_Delete or OP_IdxDelete instruction will be executed on each
-		 * cursor that is disturbed. And these instructions both clear the
-		 * VdbeCursor.seekResult variable, disabling the OPFLAG_USESEEKRESULT
-		 * functionality.
-		 */
-		bUseSeek = isReplace == 0 || (pTrigger == 0 &&
+		isUseSeek = isReplace == 0 || (pTrigger == 0 &&
 					      ((user_session->sql_flags &
 						SQLITE_ForeignKeys) == 0 ||
 					       sqlite3FkReferences(pTab) == 0));
 		sqlite3CompleteInsertion(pParse, pTab, iIdxCur, aRegIdx,
-					 bUseSeek, onError);
-	}
-
-	/* Update the count of rows that are inserted
-	 */
-	if ((user_session->sql_flags & SQLITE_CountRows) != 0) {
-		sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+					 isUseSeek, onError);
 	}
 
 	if (pTrigger) {
@@ -1015,7 +1027,8 @@ checkConstraintUnchanged(Expr * pExpr, int *aiChng)
  * of the pTab->pIndex list.
  *
  * This routine also generates code to check constraints.  NOT NULL,
- * CHECK, and UNIQUE constraints are all checked.  If a constraint fails,
+ * CHECK, and UNIQUE constraints are all checked if they need bytecode
+ * for successful execution.  If a constraint fails,
  * then the appropriate action is performed.  There are five possible
  * actions: ROLLBACK, ABORT, FAIL, REPLACE, and IGNORE.
  *
@@ -1024,11 +1037,16 @@ checkConstraintUnchanged(Expr * pExpr, int *aiChng)
  *  any              ROLLBACK     The current transaction is rolled back and
  *                                sqlite3_step() returns immediately with a
  *                                return code of SQLITE_CONSTRAINT.
+ *                                Constraint verification will be done
+ *                                by VDBE bytecode.
  *
  *  any              ABORT        Back out changes from the current command
  *                                only (do not do a complete rollback) then
  *                                cause sqlite3_step() to return immediately
  *                                with SQLITE_CONSTRAINT.
+ *                                Constraint will be verified by Tarantool,
+ *                                no need for additional bytecode in that
+ *                                case.
  *
  *  any              FAIL         Sqlite3_step() returns immediately with a
  *                                return code of SQLITE_CONSTRAINT.  The
@@ -1039,13 +1057,19 @@ checkConstraintUnchanged(Expr * pExpr, int *aiChng)
  *                                row is skipped, without throwing an error.
  *                                Processing continues with the next row.
  *                                (There is an immediate jump to ignoreDest.)
+ *                                Constraint verification will be done
+ *                                by VDBE bytecode.
  *
  *  NOT NULL         REPLACE      The NULL value is replace by the default
  *                                value for that column.  If the default value
  *                                is NULL, the action is the same as ABORT.
+ *                                Constraint verification will be done
+ *                                by VDBE bytecode.
  *
  *  UNIQUE           REPLACE      The other row that conflicts with the row
  *                                being inserted is removed.
+ *                                Constraint verification will be done
+ *                                by VDBE bytecode.
  *
  *  CHECK            REPLACE      Illegal.  The results in an exception.
  *
@@ -1053,6 +1077,23 @@ checkConstraintUnchanged(Expr * pExpr, int *aiChng)
  * Or if overrideError==OE_Default, then the pParse->onError parameter
  * is used.  Or if pParse->onError==OE_Default then the onError value
  * for the constraint is used.
+ *
+ * There are possible modes in which this function is working:
+ * 1) CONSTRAINT_REPLACE_MODE - It will generate
+ *    bytecode for UNIQUE and NOT NULL constraints with ON CONFLICT REPLACE
+ *    error action, for other constraints this call will be no-op.
+ *    If conflict happens during that stage, the appropriate conflicting
+ *    entry will be deleted by bytecode.
+ *
+ *    sqlite3GenerateConstraintChecks with CONSTRAINT_MAIN_MODE assumes
+ *    that it was called before generating bytecode for firing BEFORE triggers.
+ *
+ * 2) CONSTRAINT_DEFAULT_MODE - function with that mode argument will
+ *    generate bytecode for all constraints, including the ones with
+ *    ON CONFLICT REPLACE error action. For constraints with REPLACE action,
+ *    it assumes that possible conflicting entry was deleted before,
+ *    but unpresence still will be ensured with ABORT action. For other
+ *    error actions type everything is usual.
  */
 void
 sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
@@ -1065,8 +1106,9 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 				u8 pkChng,		/* Non-zero if the PRIMARY KEY changed */
 				u8 overrideError,	/* Override onError to this if not OE_Default */
 				int ignoreDest,		/* Jump to this label on an OE_Ignore resolution */
-				int *pbMayReplace,	/* OUT: Set to true if constraint may cause a replace */
-				int *aiChng)		/* column i is unchanged if aiChng[i]<0 */
+				u8 *pbMayReplace,	/* OUT: Set to true if constraint may cause a replace */
+				int *aiChng,		/* column i is unchanged if aiChng[i]<0 */
+				int mode)		/* Type of working mode - REPLACE or DEFAULT */
 {
 	Vdbe *v;		/* VDBE under constrution */
 	Index *pIdx;		/* Pointer to one of the indices */
@@ -1104,23 +1146,43 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 			continue;
 		}
 		if (aiChng && aiChng[i] < 0) {
-			/* Don't bother checking for NOT NULL on columns that do not change */
+			/* Don't bother checking for NOT NULL on columns
+			 * that do not change. */
 			continue;
 		}
 		onError = pTab->aCol[i].notNull;
-		if (onError == OE_None || (pTab->tabFlags & TF_Autoincrement && pTab->iAutoIncPKey == i))
+		if (onError == OE_None || (pTab->tabFlags & TF_Autoincrement &&
+					   pTab->iAutoIncPKey == i)) {
 			continue;	/* This column is allowed to be NULL */
+		}
 		if (overrideError != OE_Default) {
 			onError = overrideError;
-		} else if (onError == OE_Default) {
+		} else if (onError == OE_Default &&
+			   mode == CONSTRAINT_DEFAULT_MODE) {
 			onError = OE_Abort;
+		}
+		if (mode == CONSTRAINT_DEFAULT_MODE && onError == OE_Replace) {
+			onError = OE_Abort;
+		}
+		if (mode == CONSTRAINT_REPLACE_MODE && onError != OE_Replace) {
+			continue;
 		}
 		if (onError == OE_Replace && pTab->aCol[i].pDflt == 0) {
 			onError = OE_Abort;
 		}
-		assert(onError == OE_Rollback || onError == OE_Abort
-		       || onError == OE_Fail || onError == OE_Ignore
-		       || onError == OE_Replace);
+
+		/* Assert that one of conditions below is true:
+		 * 1) if mode is CONSTRAINT_DEFAULT_MODE, then check
+		 * that error action is ROLLBACK, ABORT, FAIL or IGNORE.
+		 * 2) if error action is CONSTRAINT_REPLACE_MODE,
+		 * then check that error action is REPLACE or ABORT.
+		 */
+		assert((mode == CONSTRAINT_DEFAULT_MODE && /* 1) */
+			(onError == OE_Rollback || onError == OE_Abort ||
+			 onError == OE_Fail ||
+			 onError == OE_Ignore)) ||
+		       (mode == CONSTRAINT_REPLACE_MODE && /* 2) */
+			(onError == OE_Abort || onError == OE_Replace)));
 		switch (onError) {
 		case OE_Abort:
 			sqlite3MayAbort(pParse);
@@ -1159,11 +1221,10 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 		}
 	}
 
-	/* Test all CHECK constraints
-	 */
+	/* Test all CHECK constraint (will be done only in DEFAULT mode). */
 #ifndef SQLITE_OMIT_CHECK
-	if (pTab->pCheck && (user_session->sql_flags &
-			     SQLITE_IgnoreChecks) == 0) {
+	if (mode == CONSTRAINT_DEFAULT_MODE && pTab->pCheck && 
+	    (user_session->sql_flags & SQLITE_IgnoreChecks) == 0) {
 		ExprList *pCheck = pTab->pCheck;
 		pParse->ckBase = regNewData + 1;
 		onError =
@@ -1194,7 +1255,7 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 			sqlite3VdbeResolveLabel(v, allOk);
 		}
 	}
-#endif				/* !defined(SQLITE_OMIT_CHECK) */
+#endif	/* !defined(SQLITE_OMIT_CHECK) */
 
 	/* Test all UNIQUE constraints by creating entries for each UNIQUE
 	 * index and making sure that duplicate entries do not already exist.
@@ -1216,12 +1277,43 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 
 		if (aRegIdx[ix] == 0)
 			continue;	/* Skip indices that do not change */
+
+		iThisCur = iIdxCur + ix;
+		addrUniqueOk = sqlite3VdbeMakeLabel(v);
+
+		/* Find out what action to take in case
+		 * there is a uniqueness conflict.
+		 */
+		onError = pIdx->onError;
+		if (!IsUniqueIndex(pIdx)) {
+			sqlite3VdbeResolveLabel(v, addrUniqueOk);
+			continue;	/* pIdx is not a UNIQUE index */
+		}
+		if (overrideError != OE_Default) {
+			onError = overrideError;
+		} else if (onError == OE_Default) {
+			onError = OE_Abort;
+		}
+		/* If we are checking ON CONFLICT REPLACE before UPDATE/INSERT,
+		 * then skip iteration if onError is not OE_Replace
+		 */
+		if (mode == CONSTRAINT_REPLACE_MODE && onError != OE_Replace) {
+			sqlite3VdbeResolveLabel(v, addrUniqueOk);
+			continue;
+		}
+		/* When we check all UNIQUE constraints during UPDATE/INSERT,
+		 * onError action for constraints with ON CONFLICT REPLACE
+		 * should be ABORT, because REPLACE actions have been already
+		 * done in the beginning of insertion/update.
+		 */
+		if (mode == CONSTRAINT_DEFAULT_MODE && onError == OE_Replace) {
+			onError = OE_Abort;
+		}
+
 		if (bAffinityDone == 0) {
 			sqlite3TableAffinity(v, pTab, regNewData+1);
 			bAffinityDone = 1;
 		}
-		iThisCur = iIdxCur + ix;
-		addrUniqueOk = sqlite3VdbeMakeLabel(v);
 
 		/* Skip partial indices for which the WHERE clause is not true */
 		if (pIdx->pPartIdxWhere) {
@@ -1233,7 +1325,8 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 		}
 
 		/* Create a record for this index entry as it should appear after
-		 * the insert or update.  Store that record in the aRegIdx[ix] register
+		 * the insert or update.  Store that record in the
+		 * aRegIdx[ix] register.
 		 */
 		regIdx = aRegIdx[ix] + 1;
 		for (i = 0; i < pIdx->nColumn; i++) {
@@ -1325,17 +1418,23 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 			onError = OE_Abort;
 		}
 
-		/* Collision detection may be omitted if all of the following are true:
-		 *   (1) The conflict resolution algorithm is REPLACE
-		 *   (2) There are no secondary indexes on the table
-		 *   (3) No delete triggers need to be fired if there is a conflict
-		 *   (4) No FK constraint counters need to be updated if a conflict occurs.
+		/* Collision detection may be omitted if all of the
+		 * following are true:
+		 *   (1) The conflict resolution algorithm is REPLACE.
+		 *   (2) There are no secondary indexes on the table.
+		 *   (3) No delete triggers need to be fired if there
+		 *       is a conflict.
+		 *   (4) No FK constraint counters need to be updated
+		 *       if a conflict occurs.
 		 */
 		if ((ix == 0 && pIdx->pNext == 0)	/* Condition 2 */
-		    && onError == OE_Replace	/* Condition 1 */
-		    && (0 == (user_session->sql_flags & SQLITE_RecTriggers)	/* Condition 3 */
+		    /* Condition 1 */
+		    && onError == OE_Replace
+		    /* Condition 3 */
+		    && (0 == (user_session->sql_flags & SQLITE_RecTriggers)
 			||0 == sqlite3TriggersExist(pTab, TK_DELETE, 0, 0))
-		    && (0 == (user_session->sql_flags & SQLITE_ForeignKeys) ||	/* Condition 4 */
+		    /* Condition 4 */
+		    && (0 == (user_session->sql_flags & SQLITE_ForeignKeys) ||
 			(0 == pTab->pFKey && 0 == sqlite3FkReferences(pTab)))
 		    ) {
 			sqlite3VdbeResolveLabel(v, addrUniqueOk);
@@ -1408,10 +1507,19 @@ sqlite3GenerateConstraintChecks(Parse * pParse,		/* The parser context */
 			}
 		}
 
-		/* Generate code that executes if the new index entry is not unique */
-		assert(onError == OE_Rollback || onError == OE_Abort
-		       || onError == OE_Fail || onError == OE_Ignore
-		       || onError == OE_Replace);
+		/* Generate code that executes if the new index entry is
+		 * not unique.
+		 * Assert that one of conditions below is true:
+		 * 1) if mode is CONSTRAINT_DEFAULT_MODE, then check
+		 * that error action is ROLLBACK, ABORT, FAIL or IGNORE.
+		 * 2) if error action is CONSTRAINT_REPLACE_MODE,
+		 * then check that error action is REPLACE or ABORT.
+		 */
+		assert((mode == CONSTRAINT_DEFAULT_MODE && (onError == OE_Rollback
+		       || onError == OE_Abort || onError == OE_Fail
+		       || onError == OE_Ignore || onError == OE_Replace)) ||
+		       (mode == CONSTRAINT_REPLACE_MODE && (onError == OE_Abort ||
+		       onError == OE_Replace)));
 		switch (onError) {
 		case OE_Fail:
 		case OE_Rollback:{
