@@ -1822,6 +1822,35 @@ emitNewSysSpaceSequenceRecord(Parse *pParse, int space_id, const char reg_seq_id
 	return first_col;
 }
 
+static bool
+checkMultipleReplaceEntries(Table * pTab)
+{
+	bool onReplaceUsed = false;
+	Index * pIdx;
+	int i;
+
+	for (pIdx = pTab->pIndex; pIdx; pIdx = pIdx->pNext) {
+		if (pIdx->onError == OE_Replace) {
+	       		if (onReplaceUsed == true) {
+				return true;
+			}
+			onReplaceUsed = true;
+		}
+	}
+
+	for (i = 0; i < pTab->nCol; i++) {
+		u8 onError = pTab->aCol[i].notNull;
+		if (onError == OE_Replace) {
+	       		if (onReplaceUsed == true) {
+				return true;
+			}
+			onReplaceUsed = true;
+		}
+	}
+
+	return false;
+}
+
 /*
  * This routine is called to report the final ")" that terminates
  * a CREATE TABLE statement.
@@ -1882,6 +1911,13 @@ sqlite3EndTable(Parse * pParse,	/* Parse context */
 		} else {
 			convertToWithoutRowidTable(pParse, p);
 		}
+	}
+
+	if (checkMultipleReplaceEntries(p)) {
+		sqlite3ErrorMsg(pParse,
+				"in table %s - only one ON CONFLICT REPLACE is allowed",
+				p->zName);
+		return;
 	}
 
 #ifndef SQLITE_OMIT_CHECK
