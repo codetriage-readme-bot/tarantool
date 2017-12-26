@@ -7373,10 +7373,11 @@ balance(BtCursor * pCur)
  * to decode the key.
  */
 int
-sqlite3BtreeInsert(BtCursor * pCur,	/* Insert data into the table of this cursor */
-		   const BtreePayload * pX,	/* Content of the row to be inserted */
-		   int appendBias,	/* True if this is likely an append */
-		   int seekResult	/* Result of prior MovetoUnpacked() call */
+sqlite3BtreeInsert(BtCursor * pCur,		  /* Insert data into the table of this cursor */
+		   const BtreePayload * pX,	  /* Content of the row to be inserted */
+		   int appendBias,		  /* True if this is likely an append */
+		   int seekResult,		  /* Result of prior MovetoUnpacked() call */
+		   box_tuple_t ** inserted_tuple /* inserted tuple */
     )
 {
 	int rc;
@@ -7412,7 +7413,7 @@ sqlite3BtreeInsert(BtCursor * pCur,	/* Insert data into the table of this cursor
 	assert((pX->pKey == 0) == (pCur->pKeyInfo == 0));
 
 	if (pCur->curFlags & BTCF_TaCursor) {
-		return tarantoolSqlite3Insert(pCur, pX);
+		return tarantoolSqlite3Insert(pCur, pX, inserted_tuple);
 	}
 
 	/* Save the positions of any other cursors open on this table.

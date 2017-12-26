@@ -271,8 +271,11 @@ struct BtreePayload {
 	int nZero;		/* Extra zero data appended after pData,nData */
 };
 
+typedef struct tuple box_tuple_t; 
+
 int sqlite3BtreeInsert(BtCursor *, const BtreePayload * pPayload,
-		       int bias, int seekResult);
+		       int bias, int seekResult,
+		       box_tuple_t ** inserted_tuple);
 int sqlite3BtreeFirst(BtCursor *, int *pRes);
 int sqlite3BtreeLast(BtCursor *, int *pRes);
 int sqlite3BtreeNext(BtCursor *, int *pRes);

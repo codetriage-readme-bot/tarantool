@@ -41,6 +41,10 @@
  */
 #include "box/txn.h"
 #include "box/session.h"
+#include "box/tuple.h"
+#include "box/space.h"
+#include "box/space_def.h"
+#include "box/index_def.h"
 #include "sqliteInt.h"
 #include "btreeInt.h"
 #include "vdbeInt.h"
@@ -4225,6 +4229,44 @@ case OP_FCopy: {     /* out2 */
 	break;
 }
 
+/* Opcode: NewPkValue P1 P2 * * *
+ * Synopsis: r[P2]=rowid
+ *
+ * Get a new primary key value for an autoincrement field. Register P1 contains
+ * a page number of an autoincrement space. This opcode gets a new value from
+ * a Tarantool sequence and writes result into P2.
+ *
+ * If P3>0 then P3 is a register in the root frame of this VDBE that holds
+ * the largest previously generated record number. No new record numbers are
+ * allowed to be less than this value. When this value reaches its maximum,
+ * an SQLITE_FULL error is generated. The P3 register is updated with the '
+ * generated record number. This P3 mechanism is used to help implement the
+ * AUTOINCREMENT feature.
+ */
+case OP_NewPkValue: {           /* out2 */
+	i64 new_value = 0;	/* new primary key value */
+	int space_id = 0;	/* id of space containing necessary pk */
+	int pageno = pOp->p1;	/* SQL pageno of space */
+
+	pOut = out2Prerelease(p, pOp);
+
+	assert(pOp->p1 > 0);
+
+	/* Get space structure from a SQL page number */
+	space_id = SQLITE_PAGENO_TO_SPACEID(pageno); 
+	struct space * autoinc_space = space_by_id(space_id);
+	assert(unlikely(autoinc_space));
+
+	/* This opcode is used only in case of autoinc, so Tarantool sequence
+	 * should always exist */
+	struct sequence *seq = autoinc_space->sequence;
+	assert(unlikely(seq));
+
+	pOut->u.i = new_value;
+
+	break;
+}
+
 /* Opcode: NewRowid P1 P2 P3 * *
  * Synopsis: r[P2]=rowid
  *
@@ -4358,6 +4400,7 @@ case OP_NewRowid: {           /* out2 */
 		pC->cacheStatus = CACHE_STALE;
 	}
 	pOut->u.i = v;
+	//pOut->flags = MEM_Int;
 	break;
 }
 
@@ -4473,8 +4516,10 @@ case OP_InsertInt: {
 		x.nZero = 0;
 	}
 	x.pKey = 0;
+	struct tuple * inserted_tuple;
 	rc = sqlite3BtreeInsert(pC->uc.pCursor, &x,
-				(pOp->p5 & OPFLAG_APPEND)!=0, seekResult
+				(pOp->p5 & OPFLAG_APPEND)!=0, seekResult,
+				&inserted_tuple
 		);
 	pC->deferredMoveto = 0;
 	pC->cacheStatus = CACHE_STALE;
@@ -5107,16 +5152,41 @@ case OP_IdxInsert: {        /* in2 */
 	if (pOp->opcode==OP_SorterInsert) {
 		rc = sqlite3VdbeSorterWrite(pC, pIn2);
 	} else {
+		pOut = out2Prerelease(p, pOp);
+
 		x.nKey = pIn2->n;
 		x.pKey = pIn2->z;
 		x.aMem = aMem + pOp->p3;
 		x.nMem = (u16)pOp->p4.i;
+
+		struct tuple * inserted_tuple;
+		int fieldno = -1;
+
 		rc = sqlite3BtreeInsert(pC->uc.pCursor, &x,
 					(pOp->p5 & OPFLAG_APPEND)!=0,
-					((pOp->p5 & OPFLAG_USESEEKRESULT) ? pC->seekResult : 0)
-			);
+					((pOp->p5 & OPFLAG_USESEEKRESULT) ? pC->seekResult : 0),
+					&inserted_tuple);
+
+		uint64_t value;
+
+		if (!pC->isEphemeral && rc == SQLITE_OK) {
+			int space_id = SQLITE_PAGENO_TO_SPACEID(pC->pgnoRoot);
+			struct space * space = space_by_id(space_id);
+			assert(space_id >= 0);
+
+			struct index * pk = space_index(space, 0);
+			assert(index);
+
+			fieldno = pk->def->key_def->parts[0].fieldno;
+			assert(fieldno >= 0);
+			tuple_field_u64(inserted_tuple, fieldno, &value);
+		}
+
 		assert(pC->deferredMoveto==0);
 		pC->cacheStatus = CACHE_STALE;
+
+		pOut->u.i = value;
+		pOut->flags = MEM_Int;
 	}
 	if (rc) goto abort_due_to_error;
 	break;
