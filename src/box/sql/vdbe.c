@@ -5185,8 +5185,10 @@ case OP_IdxInsert: {        /* in2 */
 		assert(pC->deferredMoveto==0);
 		pC->cacheStatus = CACHE_STALE;
 
+		/*
 		pOut->u.i = value;
 		pOut->flags = MEM_Int;
+		*/
 	}
 	if (rc) goto abort_due_to_error;
 	break;
