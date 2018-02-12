@@ -850,7 +850,8 @@ x = 0
 for i = 1, N do x = x + long_call_channel:get() end
 x
 
--- Check that a connection does not leak if there is
+--
+-- gh-2998: check that a connection does not leak if there is
 -- a long CALL in progress when it is closed.
 disconnected = false
 function on_disconnect() disconnected = true end
