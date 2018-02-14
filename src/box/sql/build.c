@@ -382,7 +382,7 @@ sqlite3ResetOneSchema(sqlite3 * db)
 {
 	/* Case 1:  Reset the single schema of the database  */
 	assert(db->pSchema != 0);
-	sqlite3SchemaClear(db->pSchema);
+	sqlite3SchemaClear(db);
 }
 
 /*
@@ -394,7 +394,7 @@ sqlite3ResetAllSchemasOfConnection(sqlite3 * db)
 {
 	struct session *user_session = current_session();
 	if (db->pSchema) {
-		sqlite3SchemaClear(db->pSchema);
+		sqlite3SchemaClear(db);
 	}
 	user_session->sql_flags &= ~SQLITE_InternChanges;
 }
@@ -1205,7 +1205,7 @@ sqlite3ChangeCookie(Parse * pParse)
 	sqlite3 *db = pParse->db;
 	Vdbe *v = pParse->pVdbe;
 	sqlite3VdbeAddOp3(v, OP_SetCookie, 0, 0,
-			  db->mdb.pSchema->schema_cookie + 1);
+			  db->pSchema->schema_cookie + 1);
 }
 
 /*
@@ -2226,7 +2226,6 @@ sqlite3ViewGetColumnNames(Parse * pParse, Table * pTable)
 	} else {
 		nErr++;
 	}
-	pTable->pSchema->schemaFlags |= DB_UnresetViews;
 #endif				/* SQLITE_OMIT_VIEW */
 	return nErr;
 }
@@ -2249,7 +2248,6 @@ sqliteViewResetAll(sqlite3 * db)
 			pTab->nCol = 0;
 		}
 	}
-	DbClearProperty(db, DB_UnresetViews);
 }
 #else
 #define sqliteViewResetAll(A,B)
