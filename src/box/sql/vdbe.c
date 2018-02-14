@@ -3016,69 +3016,31 @@ case OP_AutoCommit: {
 	break;
 }
 
-/* Opcode: Transaction P1 P2 * * *
+/* Opcode: TTransaction P1 P2 * * *
  *
- * Begin a transaction on database P1 if a transaction is not already
- * active.
- * If P2 is non-zero, then a write-transaction is started, or if a
- * read-transaction is already active, it is upgraded to a write-transaction.
- * If P2 is zero, then a read-transaction is started.
+ * Start Tarantool's transaction if P1 is not zero. If P2 is
+ * non-zero, then write-transaction is started (from VDBE
+ * point of view), if P2 is zero, then a read-transaction
+ * is started (temporarily leave it as it is, VDBE
+ * flags like readOnly and others will be removed later).
  *
- * P1 is the index of the database file on which the transaction is
- * started.  Index 0 is the main database file and index 1 is the
- * file used for temporary tables.  Indices of 2 or more are used for
- * attached databases.
- *
- * If a write-transaction is started and the Vdbe.usesStmtJournal flag is
- * true (this flag is set if the Vdbe may modify more than one row and may
- * throw an ABORT exception), a statement transaction may also be opened.
- * More specifically, a statement transaction is opened if the database
- * connection is currently not in autocommit mode, or if there are other
- * active statements. A statement transaction allows the changes made by this
- * VDBE to be rolled back after an error without having to roll back the
- * entire transaction. If no error is encountered, the statement transaction
- * will automatically commit when the VDBE halts.
- *
- */
-case OP_Transaction: {
-	assert(p->bIsReader);
-	assert(p->readOnly==0 || pOp->p2==0);
-	assert(pOp->p1==0);
-	if (pOp->p2 && (user_session->sql_flags & SQLITE_QueryOnly)!=0) {
-		rc = SQLITE_READONLY;
-		goto abort_due_to_error;
-	}
-
-	testcase(rc == SQLITE_BUSY_SNAPSHOT);
-	testcase(rc == SQLITE_BUSY_RECOVERY);
-	if (rc != SQLITE_OK) {
-		if ((rc&0xff) == SQLITE_BUSY) {
-			p->pc = (int)(pOp - aOp);
-			p->rc = rc;
-			goto vdbe_return;
-		}
-		goto abort_due_to_error;
-	}
-
-	if (rc) goto abort_due_to_error;
-	break;
-}
-
-/* Opcode: TTransaction * * * * *
- *
- * Start Tarantool's transaction.
- * Only do that if auto commit mode is on. This should be no-op
- * if this opcode was emitted inside a transaction.
- * Auto commit mode is disabled by OP_Transaction.
+ * Only start Tarantool transaction if auto commit
+ * mode is on. This should be no-op this opcode was
+ * emitted inside a transaction.
  */
 case OP_TTransaction: {
-	if (p->autoCommit) {
-		rc = box_txn_begin() == 0 ? SQLITE_OK : SQL_TARANTOOL_ERROR;
-	}
-	if (box_txn()
-	    && p->autoCommit == 0){
-		p->anonymous_savepoint = sql_savepoint(p, NULL);
+	if (pOp->p1) {
+		if (p->autoCommit) {
+			if (box_txn_begin() == 0) {
+				rc = SQLITE_OK;
+			} else {
+				rc = SQL_TARANTOOL_ERROR;
+			}
+		}
+		if (box_txn() && p->autoCommit == 0) {
+			p->anonymous_savepoint = sql_savepoint(p, NULL);
 
+		}
 	}
 	break;
 }

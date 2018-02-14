@@ -99,12 +99,10 @@ sqlite3FinishCoding(Parse * pParse)
 			Schema *pSchema;
 			if (DbMaskTest(pParse->cookieMask, 0) != 0) {
 				pSchema = db->pSchema;
-				sqlite3VdbeAddOp2(v, OP_Transaction,	/* Opcode */
-						  0,	/* P1 */
-						  DbMaskTest(pParse->writeMask, 0)	/* P2 */
-				    );
-				if (pParse->initiateTTrans)
-					sqlite3VdbeAddOp0(v, OP_TTransaction);
+
+				sqlite3VdbeAddOp2(v, OP_TTransaction,
+						  pParse->initiateTTrans,
+						  DbMaskTest(pParse->writeMask, 0));
 
 				if (db->init.busy == 0)
 					sqlite3VdbeChangeP5(v, 1);

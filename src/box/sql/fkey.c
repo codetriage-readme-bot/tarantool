@@ -797,7 +797,8 @@ sqlite3FkDropTable(Parse * pParse, SrcList * pName, Table * pTab)
 
 		pParse->disableTriggers = 1;
 		/* Staring new transaction before DELETE FROM <tbl> */
-		sqlite3VdbeAddOp0(v, OP_TTransaction);
+		sqlite3VdbeAddOp2(v, OP_TTransaction, 1,
+				  DbMaskTest(pParse->writeMask, 0));
 		sqlite3DeleteFrom(pParse, sqlite3SrcListDup(db, pName, 0), 0);
 		pParse->disableTriggers = 0;
 

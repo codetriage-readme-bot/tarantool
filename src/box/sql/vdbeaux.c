@@ -673,7 +673,7 @@ resolveP2Values(Vdbe * p, int *pMaxFuncArgs)
 			 * cases from this switch!
 			 */
 			switch (pOp->opcode) {
-			case OP_Transaction:{
+			case OP_TTransaction: {
 					if (pOp->p2 != 0)
 						p->readOnly = 0;
 					/* fall thru */

@@ -220,9 +220,7 @@ sqlite3Update(Parse * pParse,		/* The parser context */
 
 	/* Resolve the column names in all the expressions of the
 	 * of the UPDATE statement.  Also find the column index
-	 * for each column to be updated in the pChanges array.  For each
-	 * column to be updated, make sure we have authorization to change
-	 * that column.
+	 * for each column to be updated in the pChanges array.
 	 */
 	chngPk = 0;
 	for (i = 0; i < pChanges->nExpr; i++) {

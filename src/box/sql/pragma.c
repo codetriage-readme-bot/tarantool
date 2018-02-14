@@ -831,7 +831,6 @@ sqlite3Pragma(Parse * pParse, Token * pId,	/* First part of [schema.]id field */
 			    && (pPragma->mPragFlg & PragFlg_ReadOnly) == 0) {
 				/* Write the specified cookie value */
 				static const VdbeOpList setCookie[] = {
-					{OP_Transaction, 0, 1, 0},	/* 0 */
 					{OP_SetCookie, 0, 0, 0},	/* 1 */
 				};
 				VdbeOp *aOp;
@@ -851,7 +850,6 @@ sqlite3Pragma(Parse * pParse, Token * pId,	/* First part of [schema.]id field */
 			} else {
 				/* Read the specified cookie value */
 				static const VdbeOpList readCookie[] = {
-					{OP_Transaction, 0, 0, 0},	/* 0 */
 					{OP_ReadCookie, 0, 1, 0},	/* 1 */
 					{OP_ResultRow, 1, 1, 0}
 				};
