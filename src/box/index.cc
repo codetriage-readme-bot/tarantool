@@ -38,6 +38,7 @@
 #include "txn.h"
 #include "rmean.h"
 #include "info.h"
+#include "tuple_compare.h"
 
 /* {{{ Utilities. **********************************************/
 
@@ -566,6 +567,9 @@ generic_index_min(struct index *index, const char *key,
 	if (it == NULL)
 		return -1;
 	int rc = iterator_next(it, result);
+	if (*result != NULL && tuple_compare_with_key(*result, key, part_count,
+						      index->def->key_def) != 0)
+		*result = NULL;
 	iterator_delete(it);
 	return rc;
 }
@@ -579,6 +583,9 @@ generic_index_max(struct index *index, const char *key,
 	if (it == NULL)
 		return -1;
 	int rc = iterator_next(it, result);
+	if (*result != NULL && tuple_compare_with_key(*result, key, part_count,
+						      index->def->key_def) != 0)
+		*result = NULL;
 	iterator_delete(it);
 	return rc;
 }
