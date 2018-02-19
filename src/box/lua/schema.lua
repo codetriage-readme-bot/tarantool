@@ -338,6 +338,13 @@ function update_format(format)
                     field.name = v;
                 elseif k == 2 then
                     field.type = v;
+                elseif k == 'collation' then
+                    local coll = box.space._collation.index.name:get{v}
+                    if not coll then
+                        box.error(box.error.ILLEGAL_PARAMS,
+                            "format[" .. i .. "]: collation was not found by name '" .. v .. "'")
+                    end
+                    field[k] = coll[1]
                 else
                     field[k] = v
                 end
