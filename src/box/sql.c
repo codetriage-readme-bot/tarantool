@@ -488,7 +488,7 @@ int tarantoolSqlite3EphemeralCreate(BtCursor *pCur, uint32_t field_count,
  *
  * @retval SQLITE_OK on success, SQLITE_TARANTOOL_ERROR otherwise.
  */
-int tarantoolSqlite3EphemeralInsert(BtCursor *pCur, const CursorPayload *pX)
+int tarantoolSqlite3EphemeralInsert(BtCursor *pCur, const BtCursor *pX)
 {
 	assert(pCur);
 	assert(pCur->curFlags & BTCF_TEphemCursor);
@@ -519,7 +519,7 @@ int tarantoolSqlite3EphemeralDrop(BtCursor *pCur)
 	return SQLITE_OK;
 }
 
-static int insertOrReplace(BtCursor *pCur, const CursorPayload *pX,
+static int insertOrReplace(BtCursor *pCur, const BtCursor *pX,
 		           int operationType)
 {
 	assert(pCur->curFlags & BTCF_TaCursor);
@@ -541,12 +541,12 @@ static int insertOrReplace(BtCursor *pCur, const CursorPayload *pX,
 	return rc == 0 ? SQLITE_OK : SQL_TARANTOOL_INSERT_FAIL;;
 }
 
-int tarantoolSqlite3Insert(BtCursor *pCur, const CursorPayload *pX)
+int tarantoolSqlite3Insert(BtCursor *pCur, const BtCursor *pX)
 {
 	return insertOrReplace(pCur, pX, TARANTOOL_INDEX_INSERT);
 }
 
-int tarantoolSqlite3Replace(BtCursor *pCur, const CursorPayload *pX)
+int tarantoolSqlite3Replace(BtCursor *pCur, const BtCursor *pX)
 {
 	return insertOrReplace(pCur, pX, TARANTOOL_INDEX_REPLACE);
 }

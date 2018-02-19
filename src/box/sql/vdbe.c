@@ -4457,7 +4457,7 @@ case OP_SorterInsert:       /* in2 */
 case OP_IdxReplace:
 case OP_IdxInsert: {        /* in2 */
 	VdbeCursor *pC;
-	CursorPayload x;
+	BtCursor x;
 
 	assert(pOp->p1>=0 && pOp->p1<p->nCursor);
 	pC = p->apCsr[pOp->p1];
@@ -4474,8 +4474,6 @@ case OP_IdxInsert: {        /* in2 */
 	} else {
 		x.nKey = pIn2->n;
 		x.pKey = pIn2->z;
-		x.aMem = aMem + pOp->p3;
-		x.nMem = (u16)pOp->p4.i;
 
 		BtCursor *pBtCur = pC->uc.pCursor;
 		assert((x.pKey == 0) == (pBtCur->pKeyInfo == 0));
