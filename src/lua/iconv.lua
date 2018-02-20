@@ -4,9 +4,9 @@ local buffer = require('buffer')
 
 ffi.cdef[[
 typedef struct iconv *iconv_t;
-iconv_t iconv_open(const char *tocode, const char *fromcode);
-void    iconv_close(iconv_t cd);
-size_t  iconv(iconv_t cd, const char **inbuf, size_t *inbytesleft,
+iconv_t iconv_wrap_open(const char *tocode, const char *fromcode);
+void    iconv_wrap_close(iconv_t cd);
+size_t  iconv_wrap(iconv_t cd, const char **inbuf, size_t *inbytesleft,
               char **outbuf, size_t *outbytesleft);
 ]]
 
@@ -41,10 +41,10 @@ local function iconv_convert(iconv, data)
     while data_left[0] > 0 do
         buf_ptr[0]  = buf:reserve(output_len)
         buf_left[0] = buf:unused()
-        local res = ffi.C.iconv(iconv, data_ptr, data_left,
+        local res = ffi.C.iconv_wrap(iconv, data_ptr, data_left,
                                 buf_ptr, buf_left)
         if res == ffi.cast('size_t', -1) and errno() ~= E2BIG then
-            ffi.C.iconv(iconv, nil, nil, nil, nil)
+            ffi.C.iconv_wrap(iconv, nil, nil, nil, nil)
             if errno() == EINVAL then
                 error('Invalid multibyte sequence')
             end
@@ -57,7 +57,7 @@ local function iconv_convert(iconv, data)
     end
 
     -- iconv function sets cd's conversion state to the initial state
-    ffi.C.iconv(iconv, nil, nil, nil, nil)
+    ffi.C.iconv_wrap(iconv, nil, nil, nil, nil)
     local result = ffi.string(buf.rpos, buf:size())
     buf:reset()
     return result
@@ -65,7 +65,7 @@ end
 
 local iconv_mt = {
     __call = iconv_convert,
-    __gc = ffi.C.iconv_close,
+    __gc = ffi.C.iconv_wrap_close,
     __tostring = function(iconv) return string.format("iconv: %p", iconv) end
 }
 
@@ -75,7 +75,7 @@ local function iconv_new(to, from)
     if type(to) ~= 'string' or type(from) ~= 'string' then
         error('Usage: iconv.new("CP1251", "KOI8-R")')
     end
-    local iconv = ffi.C.iconv_open(to, from)
+    local iconv = ffi.C.iconv_wrap_open(to, from)
     if iconv == conv_rv_error then
         error('iconv: '..errno.strerror())
     end

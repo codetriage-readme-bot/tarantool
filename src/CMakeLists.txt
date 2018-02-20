@@ -158,6 +158,7 @@ set (server_sources
      lua/msgpack.c
      lua/utils.c
      lua/errno.c
+     lua/iconv_wrap.c
      lua/socket.c
      lua/pickle.c
      lua/fio.c
@@ -214,12 +215,19 @@ target_link_libraries(server core bit uri uuid)
 set (reexport_libraries server core misc bitset csv
      ${LUAJIT_LIBRARIES} ${MSGPUCK_LIBRARIES} ${ICU_LIBRARIES})
 
+if (TARGET_OS_DARWIN)
+    set (ICONV_LIBRARIES /usr/lib/libiconv.dylib)
+elseif (TARGET_OS_FREEBSD)
+    set (ICONV_LIBRARIES /usr/local/lib/libiconv.so)
+endif()
+
 set (common_libraries
     ${reexport_libraries}
     ${LIBYAML_LIBRARIES}
     ${READLINE_LIBRARIES}
     ${OPENSSL_LIBRARIES}
     ${CURL_LIBRARIES}
+    ${ICONV_LIBRARIES}
 )
 
 if (TARGET_OS_LINUX OR TARGET_OS_DEBIAN_FREEBSD)
