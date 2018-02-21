@@ -1,0 +1,16 @@
+# find Iconv includes and library
+#
+# ICONV_FOUND
+# ICONV_LIBRARY
+# ICONV_INCLUDE_DIR
+
+FIND_LIBRARY(ICONV_LIBRARY NAMES iconv)
+FIND_PATH(ICONV_INCLUDE_DIR NAMES iconv.h)
+
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(Iconv
+    REQUIRED_VARS ICONV_INCLUDE_DIR ICONV_LIBRARY)
+set(ICONV_INCLUDE_DIRS ${ICONV_INCLUDE_DIR})
+set(ICONV_LIBRARIES ${ICONV_LIBRARY})
+
+mark_as_advanced(ICONV_LIBRARIES ICONV_INCLUDE_DIRS)

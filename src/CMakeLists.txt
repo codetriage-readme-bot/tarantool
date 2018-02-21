@@ -11,6 +11,7 @@ include_directories(${READLINE_INCLUDE_DIRS})
 include_directories(${LIBYAML_INCLUDE_DIRS})
 include_directories(${MSGPUCK_INCLUDE_DIRS})
 include_directories(${CURL_INCLUDE_DIRS})
+include_directories(${ICONV_INCLUDE_DIRS})
 include_directories(${ICU_INCLUDE_DIRS})
 
 set(LIBUTIL_FREEBSD_SRC ${CMAKE_SOURCE_DIR}/third_party/libutil_freebsd)
@@ -214,12 +215,6 @@ target_link_libraries(server core bit uri uuid)
 # library here.
 set (reexport_libraries server core misc bitset csv
      ${LUAJIT_LIBRARIES} ${MSGPUCK_LIBRARIES} ${ICU_LIBRARIES})
-
-if (TARGET_OS_DARWIN)
-    set (ICONV_LIBRARIES /usr/lib/libiconv.dylib)
-elseif (TARGET_OS_FREEBSD)
-    set (ICONV_LIBRARIES /usr/local/lib/libiconv.so)
-endif()
 
 set (common_libraries
     ${reexport_libraries}
