@@ -883,13 +883,25 @@ weak = setmetatable({}, {__mode = 'v'})
 strong = net.connect(connect_to, {reconnect_after = 0.5})
 weak.c = strong
 weak.c:ping()
+log.info(string.rep('a', 1000))
 test_run:cmd('stop server connecter')
 test_run:cmd('cleanup server connecter')
+-- For gh-3175 check that reconnect error messages are not
+-- repeated. At first, wait the first error message.
+while test_run:grep_log('default', 'Connection refused', 1000) == nil do fiber.sleep(0.1) end
+log.info(string.rep('a', 1000))
+-- Wait next reconnect attempt.
+fiber.sleep(0.6)
+-- The log must not contain the same error message.
+test_run:grep_log('default', 'Connection refused', 1000)
+-- Switch to verbose log level to see repeating error messages.
+old_log_level = box.cfg.log_level
+box.cfg{log_level = 6}
 -- Check the connection tries to reconnect at least two times.
-log.info(string.rep('a', 1000))
 while test_run:grep_log('default', 'Connection refused', 1000) == nil do fiber.sleep(0.1) end
 log.info(string.rep('a', 1000))
 while test_run:grep_log('default', 'Connection refused', 1000) == nil do fiber.sleep(0.1) end
+box.cfg{log_level = old_log_level}
 collectgarbage('collect')
 strong.state
 strong == weak.c
