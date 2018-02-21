@@ -112,10 +112,11 @@ local function next_id(id) return band(id + 1, 0x7FFFFFFF) end
 -- The following events are delivered, with arguments:
 --
 --  'state_changed', state, errno, error
---  'handshake', greeting           -> nil (accept) / errno, error (reject)
---  'will_fetch_schema'             -> true (approve) / false (skip fetch)
+--  'handshake', greeting -> nil (accept) / errno, error (reject)
+--  'will_fetch_schema'   -> true (approve) / false (skip fetch)
 --  'did_fetch_schema', schema_version, spaces, indices
---  'will_reconnect', errno, error  -> true (approve) / false (reject)
+--  'reconnect_timeout'   -> get reconnect timeout if set and > 0,
+--                           else nil is returned.
 --
 -- Suggestion for callback writers: sleep a few secs before approving
 -- reconnect.
@@ -193,6 +194,7 @@ local function create_transport(host, port, user, password, callback)
         fiber.create(function()
             worker_fiber = fiber_self()
             fiber.name(string.format('%s:%s (net.box)', host, port), {truncate=true})
+    ::reconnect::
             local ok, err = pcall(protocol_sm)
             if not (ok or is_final_state[state]) then
                 set_state('error', E_UNKNOWN, err)
@@ -200,6 +202,14 @@ local function create_transport(host, port, user, password, callback)
             if connection then
                 connection:close()
                 connection = nil
+            end
+            local timeout = callback('reconnect_timeout')
+            if timeout and state == 'error_reconnect' then
+                fiber.sleep(timeout)
+                timeout = callback('reconnect_timeout')
+                if timeout and state == 'error_reconnect' then
+                    goto reconnect
+                end
             end
             send_buf:recycle()
             recv_buf:recycle()
@@ -496,12 +506,12 @@ local function create_transport(host, port, user, password, callback)
         if connection then connection:close(); connection = nil end
         send_buf:recycle()
         recv_buf:recycle()
-        set_state('error_reconnect', err, msg)
-        if callback('will_reconnect', err, msg) then
-            set_state('connecting')
-            return protocol_sm()
-        else
-            set_state('error', err, msg)
+        if state ~= 'closed' then
+            if callback('reconnect_timeout') then
+                set_state('error_reconnect', err, msg)
+            else
+                set_state('error', err, msg)
+            end
         end
     end
 
@@ -629,9 +639,10 @@ local function connect(...)
             return opts.connect_timeout or 10
         elseif what == 'did_fetch_schema' then
             remote:_install_schema(...)
-        elseif what == 'will_reconnect' then
-            if type(opts.reconnect_after) == 'number' then
-                fiber.sleep(opts.reconnect_after); return true
+        elseif what == 'reconnect_timeout' then
+            if type(opts.reconnect_after) == 'number' and
+               opts.reconnect_after > 0 then
+                return opts.reconnect_after
             end
         end
     end
