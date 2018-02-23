@@ -43,7 +43,6 @@
 #include "index_def.h"
 
 #include "small/mempool.h"
-#include "salad/bloom.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -82,10 +81,8 @@ struct vy_run_info {
 	int64_t max_lsn;
 	/** Number of pages in the run. */
 	uint32_t page_count;
-	/** Set iff bloom filter is available. */
-	bool has_bloom;
 	/** Bloom filter of all tuples in run */
-	struct bloom bloom;
+	struct tuple_bloom *bloom;
 };
 
 /**
@@ -301,11 +298,11 @@ vy_run_env_destroy(struct vy_run_env *env);
 void
 vy_run_env_enable_coio(struct vy_run_env *env, int threads);
 
-static inline size_t
-vy_run_bloom_size(struct vy_run *run)
-{
-	return run->info.has_bloom ? bloom_store_size(&run->info.bloom) : 0;
-}
+/**
+ * Return the size of a run bloom filter.
+ */
+size_t
+vy_run_bloom_size(struct vy_run *run);
 
 static inline struct vy_page_info *
 vy_run_page_info(struct vy_run *run, uint32_t pos)
@@ -421,10 +418,10 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 int
 vy_run_write(struct vy_run *run, const char *dirpath,
 	     uint32_t space_id, uint32_t iid,
-	     struct vy_stmt_stream *wi, uint64_t page_size,
+	     struct vy_stmt_stream *wi,
 	     const struct key_def *cmp_def,
 	     const struct key_def *key_def,
-	     size_t max_output_count, double bloom_fpr);
+	     uint64_t page_size, double bloom_fpr);
 
 /**
  * Allocate a new run slice.

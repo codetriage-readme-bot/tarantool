@@ -131,12 +131,6 @@ struct vy_task {
 	 */
 	struct stailq_entry link;
 	/**
-	 * An estimate of the maximal number of statements that
-	 * can be written by the task. Used to create a bloom
-	 * filter of the perfect size.
-	 */
-	size_t max_output_count;
-	/**
 	 * Index options may be modified while a task is in
 	 * progress so we save them here to safely access them
 	 * from another thread.
@@ -628,9 +622,8 @@ vy_task_dump_execute(struct vy_task *task)
 
 	return vy_run_write(task->new_run, index->env->path,
 			    index->space_id, index->id, task->wi,
-			    task->page_size, index->cmp_def,
-			    index->key_def, task->max_output_count,
-			    task->bloom_fpr);
+			    index->cmp_def, index->key_def,
+			    task->page_size, task->bloom_fpr);
 }
 
 static int
@@ -900,7 +893,6 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_index *index,
 	 * eligible for dump are over.
 	 */
 	int64_t dump_lsn = -1;
-	size_t max_output_count = 0;
 	struct vy_mem *mem, *next_mem;
 	rlist_foreach_entry_safe(mem, &index->sealed, in_sealed, next_mem) {
 		if (mem->generation > scheduler->dump_generation)
@@ -915,10 +907,9 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_index *index,
 			continue;
 		}
 		dump_lsn = MAX(dump_lsn, mem->max_lsn);
-		max_output_count += mem->tree.size;
 	}
 
-	if (max_output_count == 0) {
+	if (dump_lsn < 0) {
 		/* Nothing to do, pick another index. */
 		vy_scheduler_update_index(scheduler, index);
 		vy_scheduler_complete_dump(scheduler);
@@ -934,7 +925,6 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_index *index,
 	if (new_run == NULL)
 		goto err_run;
 
-	assert(dump_lsn >= 0);
 	new_run->dump_lsn = dump_lsn;
 
 	struct vy_stmt_stream *wi;
@@ -953,7 +943,6 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_index *index,
 
 	task->new_run = new_run;
 	task->wi = wi;
-	task->max_output_count = max_output_count;
 	task->bloom_fpr = index->opts.bloom_fpr;
 	task->page_size = index->opts.page_size;
 
@@ -997,9 +986,8 @@ vy_task_compact_execute(struct vy_task *task)
 
 	return vy_run_write(task->new_run, index->env->path,
 			    index->space_id, index->id, task->wi,
-			    task->page_size, index->cmp_def,
-			    index->key_def, task->max_output_count,
-			    task->bloom_fpr);
+			    index->cmp_def, index->key_def,
+			    task->page_size, task->bloom_fpr);
 }
 
 static int
@@ -1231,11 +1219,8 @@ vy_task_compact_new(struct vy_scheduler *scheduler, struct vy_index *index,
 	rlist_foreach_entry(slice, &range->slices, in_range) {
 		if (vy_write_iterator_new_slice(wi, slice) != 0)
 			goto err_wi_sub;
-
-		task->max_output_count += slice->count.rows;
 		new_run->dump_lsn = MAX(new_run->dump_lsn,
 					slice->run->dump_lsn);
-
 		/* Remember the slices we are compacting. */
 		if (task->first_slice == NULL)
 			task->first_slice = slice;

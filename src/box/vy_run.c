@@ -40,7 +40,8 @@
 #include "coio_file.h"
 
 #include "replication.h"
-#include "tuple_hash.h" /* for bloom filter */
+#include "tuple_bloom.h"
+#include "tuple_compare.h"
 #include "xlog.h"
 #include "xrow.h"
 
@@ -56,8 +57,6 @@ static const uint64_t vy_run_info_key_map = (1 << VY_RUN_INFO_MIN_KEY) |
 					    (1 << VY_RUN_INFO_MIN_LSN) |
 					    (1 << VY_RUN_INFO_MAX_LSN) |
 					    (1 << VY_RUN_INFO_PAGE_COUNT);
-
-enum { VY_BLOOM_VERSION = 0 };
 
 /** xlog meta type for .run files */
 #define XLOG_META_TYPE_RUN "RUN"
@@ -238,7 +237,6 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 	run->refs = 1;
 	rlist_create(&run->in_index);
 	rlist_create(&run->in_unused);
-	TRASH(&run->info.bloom);
 	return run;
 }
 
@@ -254,9 +252,10 @@ vy_run_clear(struct vy_run *run)
 	run->page_info = NULL;
 	run->page_index_size = 0;
 	run->info.page_count = 0;
-	if (run->info.has_bloom)
-		bloom_destroy(&run->info.bloom, runtime.quota);
-	run->info.has_bloom = false;
+	if (run->info.bloom != NULL) {
+		tuple_bloom_delete(run->info.bloom);
+		run->info.bloom = NULL;
+	}
 	free(run->info.min_key);
 	run->info.min_key = NULL;
 	free(run->info.max_key);
@@ -272,6 +271,12 @@ vy_run_delete(struct vy_run *run)
 	vy_run_clear(run);
 	TRASH(run);
 	free(run);
+}
+
+size_t
+vy_run_bloom_size(struct vy_run *run)
+{
+	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
 }
 
 /**
@@ -534,53 +539,6 @@ vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
 }
 
 /**
- * Read bloom filter from given buffer.
- * @param bloom - a bloom filter to read.
- * @param buffer[in/out] - a buffer to read from.
- *  The pointer is incremented on the number of bytes read.
- * @param filename Filename for error reporting.
- * @return - 0 on success or -1 on format/memory error
- */
-static int
-vy_run_bloom_decode(struct bloom *bloom, const char **buffer,
-		    const char *filename)
-{
-	const char **pos = buffer;
-	memset(bloom, 0, sizeof(*bloom));
-	uint32_t array_size = mp_decode_array(pos);
-	if (array_size != 4) {
-		diag_set(ClientError, ER_INVALID_INDEX_FILE, filename,
-			 tt_sprintf("Can't decode bloom meta: "
-				    "wrong array size (expected %d, got %u)",
-				    4, (unsigned)array_size));
-		return -1;
-	}
-	uint64_t version = mp_decode_uint(pos);
-	if (version != VY_BLOOM_VERSION) {
-		diag_set(ClientError, ER_INVALID_INDEX_FILE, filename,
-			 tt_sprintf("Can't decode bloom meta: "
-				    "wrong version (expected %d, got %u)",
-				    VY_BLOOM_VERSION, (unsigned)version));
-	}
-	bloom->table_size = mp_decode_uint(pos);
-	bloom->hash_count = mp_decode_uint(pos);
-	size_t table_size = mp_decode_binl(pos);
-	if (table_size != bloom_store_size(bloom)) {
-		diag_set(ClientError, ER_INVALID_INDEX_FILE, filename,
-			 tt_sprintf("Can't decode bloom meta: "
-				    "wrong table size (expected %zu, got %zu)",
-				    bloom_store_size(bloom), table_size));
-		return -1;
-	}
-	if (bloom_load_table(bloom, *pos, runtime.quota) != 0) {
-		diag_set(OutOfMemory, bloom_store_size(bloom), "mmap", "bloom");
-		return -1;
-	}
-	*pos += table_size;
-	return 0;
-}
-
-/**
  * Decode the run metadata from xrow.
  *
  * @param xrow xrow to decode
@@ -631,11 +589,11 @@ vy_run_info_decode(struct vy_run_info *run_info,
 		case VY_RUN_INFO_PAGE_COUNT:
 			run_info->page_count = mp_decode_uint(&pos);
 			break;
+		case VY_RUN_INFO_BLOOM_LEGACY:
+			continue;
 		case VY_RUN_INFO_BLOOM:
-			if (vy_run_bloom_decode(&run_info->bloom, &pos,
-						filename) == 0)
-				run_info->has_bloom = true;
-			else
+			run_info->bloom = tuple_bloom_decode(&pos);
+			if (run_info->bloom == NULL)
 				return -1;
 			break;
 		default:
@@ -1321,18 +1279,20 @@ vy_run_iterator_do_seek(struct vy_run_iterator *itr,
 
 	*ret = NULL;
 
+	struct tuple_bloom *bloom = run->info.bloom;
 	const struct key_def *key_def = itr->key_def;
-	bool is_full_key = (tuple_field_count(key) >= key_def->part_count);
-	if (run->info.has_bloom && iterator_type == ITER_EQ && is_full_key) {
-		uint32_t hash;
+	if (iterator_type == ITER_EQ && bloom != NULL) {
+		bool need_lookup;
 		if (vy_stmt_type(key) == IPROTO_SELECT) {
 			const char *data = tuple_data(key);
-			mp_decode_array(&data);
-			hash = key_hash(data, key_def);
+			uint32_t part_count = mp_decode_array(&data);
+			need_lookup = tuple_bloom_possible_has_key(bloom,
+						data, part_count, key_def);
 		} else {
-			hash = tuple_hash(key, key_def);
+			need_lookup = tuple_bloom_possible_has(bloom, key,
+							       key_def);
 		}
-		if (!bloom_possible_has(&run->info.bloom, hash)) {
+		if (!need_lookup) {
 			itr->search_ended = true;
 			itr->stat->bloom_hit++;
 			return 0;
@@ -1378,7 +1338,7 @@ vy_run_iterator_do_seek(struct vy_run_iterator *itr,
 	if (iterator_type == ITER_EQ && !equal_found) {
 		vy_run_iterator_cache_clean(itr);
 		itr->search_ended = true;
-		if (run->info.has_bloom && is_full_key)
+		if (bloom != NULL)
 			itr->stat->bloom_miss++;
 		return 0;
 	}
@@ -1978,10 +1938,10 @@ vy_run_alloc_page_info(struct vy_run *run, uint32_t *page_info_capacity)
 static int
 vy_run_write_page(struct vy_run *run, struct xlog *data_xlog,
 		  struct vy_stmt_stream *wi, struct tuple **curr_stmt,
-		  uint64_t page_size, struct bloom_spectrum *bs,
 		  const struct key_def *cmp_def,
 		  const struct key_def *key_def, bool is_primary,
-		  uint32_t *page_info_capacity)
+		  uint64_t page_size, uint32_t *page_info_capacity,
+		  struct tuple_bloom_builder *bloom_builder)
 {
 	assert(curr_stmt != NULL);
 	assert(*curr_stmt != NULL);
@@ -2032,15 +1992,20 @@ vy_run_write_page(struct vy_run *run, struct xlog *data_xlog,
 				     cmp_def, is_primary) != 0)
 			goto error_rollback;
 
-		if (bs != NULL)
-			bloom_spectrum_add(bs, tuple_hash(*curr_stmt, key_def));
-
 		int64_t lsn = vy_stmt_lsn(*curr_stmt);
 		run->info.min_lsn = MIN(run->info.min_lsn, lsn);
 		run->info.max_lsn = MAX(run->info.max_lsn, lsn);
 
 		if (wi->iface->next(wi, curr_stmt))
 			goto error_rollback;
+
+		if (bloom_builder != NULL) {
+			uint32_t hashed_parts = *curr_stmt == NULL ? 0 :
+				tuple_common_key_parts(*curr_stmt,
+						       last_stmt, key_def);
+			tuple_bloom_builder_add(bloom_builder, last_stmt,
+						key_def, hashed_parts);
+		}
 
 		if (*curr_stmt == NULL) {
 			end_of_run = true;
@@ -2124,10 +2089,10 @@ error_row_index:
 static int
 vy_run_write_data(struct vy_run *run, const char *dirpath,
 		  uint32_t space_id, uint32_t iid,
-		  struct vy_stmt_stream *wi, uint64_t page_size,
+		  struct vy_stmt_stream *wi,
 		  const struct key_def *cmp_def,
 		  const struct key_def *key_def,
-		  size_t max_output_count, double bloom_fpr)
+		  uint64_t page_size, double bloom_fpr)
 {
 	struct tuple *stmt;
 
@@ -2141,13 +2106,11 @@ vy_run_write_data(struct vy_run *run, const char *dirpath,
 	if (stmt == NULL)
 		goto done;
 
-	struct bloom_spectrum bs;
-	bool has_bloom = bloom_fpr < 1;
-	if (has_bloom && bloom_spectrum_create(&bs, max_output_count,
-					bloom_fpr, runtime.quota) != 0) {
-		diag_set(OutOfMemory, 0,
-			 "bloom_spectrum_create", "bloom_spectrum");
-		goto err;
+	struct tuple_bloom_builder *bloom_builder = NULL;
+	if (bloom_fpr < 1) {
+		bloom_builder = tuple_bloom_builder_new(key_def->part_count);
+		if (bloom_builder == NULL)
+			goto err;
 	}
 
 	char path[PATH_MAX];
@@ -2171,9 +2134,10 @@ vy_run_write_data(struct vy_run *run, const char *dirpath,
 	uint32_t page_info_capacity = 0;
 	int rc;
 	do {
-		rc = vy_run_write_page(run, &data_xlog, wi, &stmt, page_size,
-				       has_bloom ? &bs : NULL, cmp_def, key_def,
-				       iid == 0, &page_info_capacity);
+		rc = vy_run_write_page(run, &data_xlog, wi, &stmt,
+				       cmp_def, key_def, iid == 0,
+				       page_size, &page_info_capacity,
+				       bloom_builder);
 		if (rc < 0)
 			goto err_close_xlog;
 		fiber_gc();
@@ -2188,10 +2152,11 @@ vy_run_write_data(struct vy_run *run, const char *dirpath,
 	xlog_close(&data_xlog, true);
 	fiber_gc();
 
-	if (has_bloom) {
-		bloom_spectrum_choose(&bs, &run->info.bloom);
-		run->info.has_bloom = true;
-		bloom_spectrum_destroy(&bs, runtime.quota);
+	if (bloom_builder != NULL) {
+		run->info.bloom = tuple_bloom_new(bloom_builder, bloom_fpr);
+		if (run->info.bloom == NULL)
+			goto err_free_bloom;
+		tuple_bloom_builder_delete(bloom_builder);
 	}
 done:
 	wi->iface->stop(wi);
@@ -2201,8 +2166,8 @@ err_close_xlog:
 	xlog_close(&data_xlog, false);
 	fiber_gc();
 err_free_bloom:
-	if (has_bloom)
-		bloom_spectrum_destroy(&bs, runtime.quota);
+	if (bloom_builder != NULL)
+		tuple_bloom_builder_delete(bloom_builder);
 err:
 	wi->iface->stop(wi);
 	return -1;
@@ -2284,42 +2249,6 @@ vy_page_info_encode(const struct vy_page_info *page_info,
 /** {{{ vy_run_info */
 
 /**
- * Calculate the size on disk that is needed to store give bloom filter.
- * @param bloom - storing bloom filter.
- * @return - calculated size.
- */
-static size_t
-vy_run_bloom_encode_size(const struct bloom *bloom)
-{
-	size_t size = mp_sizeof_array(4);
-	size += mp_sizeof_uint(VY_BLOOM_VERSION); /* version */
-	size += mp_sizeof_uint(bloom->table_size);
-	size += mp_sizeof_uint(bloom->hash_count);
-	size += mp_sizeof_bin(bloom_store_size(bloom));
-	return size;
-}
-
-/**
- * Write bloom filter to given buffer.
- * The buffer must have at least vy_run_bloom_encode_size()
- * @param bloom - a bloom filter to write.
- * @param buffer - a buffer to write to.
- * @return - buffer + number of bytes written.
- */
-char *
-vy_run_bloom_encode(const struct bloom *bloom, char *buffer)
-{
-	char *pos = buffer;
-	pos = mp_encode_array(pos, 4);
-	pos = mp_encode_uint(pos, VY_BLOOM_VERSION);
-	pos = mp_encode_uint(pos, bloom->table_size);
-	pos = mp_encode_uint(pos, bloom->hash_count);
-	pos = mp_encode_binl(pos, bloom_store_size(bloom));
-	pos = bloom_store(bloom, pos);
-	return pos;
-}
-
-/**
  * Encode vy_run_info as xrow
  * Allocates using region alloc
  *
@@ -2342,7 +2271,7 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	size_t max_key_size = tmp - run_info->max_key;
 
 	uint32_t key_count = 5;
-	if (run_info->has_bloom)
+	if (run_info->bloom != NULL)
 		key_count++;
 
 	size_t size = mp_sizeof_map(key_count);
@@ -2354,9 +2283,9 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 		mp_sizeof_uint(run_info->max_lsn);
 	size += mp_sizeof_uint(VY_RUN_INFO_PAGE_COUNT) +
 		mp_sizeof_uint(run_info->page_count);
-	if (run_info->has_bloom)
+	if (run_info->bloom != NULL)
 		size += mp_sizeof_uint(VY_RUN_INFO_BLOOM) +
-			vy_run_bloom_encode_size(&run_info->bloom);
+			tuple_bloom_size(run_info->bloom);
 
 	char *pos = region_alloc(&fiber()->gc, size);
 	if (pos == NULL) {
@@ -2379,9 +2308,9 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	pos = mp_encode_uint(pos, run_info->max_lsn);
 	pos = mp_encode_uint(pos, VY_RUN_INFO_PAGE_COUNT);
 	pos = mp_encode_uint(pos, run_info->page_count);
-	if (run_info->has_bloom) {
+	if (run_info->bloom != NULL) {
 		pos = mp_encode_uint(pos, VY_RUN_INFO_BLOOM);
-		pos = vy_run_bloom_encode(&run_info->bloom, pos);
+		pos = tuple_bloom_encode(run_info->bloom, pos);
 	}
 	xrow->body->iov_len = (void *)pos - xrow->body->iov_base;
 	xrow->bodycnt = 1;
@@ -2453,10 +2382,10 @@ fail:
 int
 vy_run_write(struct vy_run *run, const char *dirpath,
 	     uint32_t space_id, uint32_t iid,
-	     struct vy_stmt_stream *wi, uint64_t page_size,
+	     struct vy_stmt_stream *wi,
 	     const struct key_def *cmp_def,
 	     const struct key_def *key_def,
-	     size_t max_output_count, double bloom_fpr)
+	     uint64_t page_size, double bloom_fpr)
 {
 	ERROR_INJECT(ERRINJ_VY_RUN_WRITE,
 		     {diag_set(ClientError, ER_INJECTION,
@@ -2466,9 +2395,8 @@ vy_run_write(struct vy_run *run, const char *dirpath,
 	if (inj != NULL && inj->dparam > 0)
 		usleep(inj->dparam * 1000000);
 
-	if (vy_run_write_data(run, dirpath, space_id, iid,
-			      wi, page_size, cmp_def, key_def,
-			      max_output_count, bloom_fpr) != 0)
+	if (vy_run_write_data(run, dirpath, space_id, iid, wi,
+			      cmp_def, key_def, page_size, bloom_fpr) != 0)
 		return -1;
 
 	if (vy_run_is_empty(run))
@@ -2489,7 +2417,7 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		     struct tuple_format *upsert_format,
 		     const struct index_opts *opts)
 {
-	assert(run->info.has_bloom == false);
+	assert(run->info.bloom == NULL);
 	assert(run->page_info == NULL);
 	struct region *region = &fiber()->gc;
 	size_t mem_used = region_used(region);
@@ -2505,11 +2433,18 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 
 	int rc = 0;
 	uint32_t page_info_capacity = 0;
-	uint32_t run_row_count = 0;
 
 	const char *key = NULL;
 	int64_t max_lsn = 0;
 	int64_t min_lsn = INT64_MAX;
+	struct tuple *prev_tuple = NULL;
+
+	struct tuple_bloom_builder *bloom_builder = NULL;
+	if (opts->bloom_fpr < 1) {
+		bloom_builder = tuple_bloom_builder_new(key_def->part_count);
+		if (bloom_builder == NULL)
+			goto close_err;
+	}
 
 	off_t page_offset, next_page_offset = xlog_cursor_pos(&cursor);
 	while ((rc = xlog_cursor_next_tx(&cursor)) == 0) {
@@ -2536,8 +2471,17 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 					mem_format, upsert_format, iid == 0);
 			if (tuple == NULL)
 				goto close_err;
+			if (bloom_builder != NULL) {
+				uint32_t hashed_parts = prev_tuple == NULL ? 0 :
+					tuple_common_key_parts(prev_tuple,
+							       tuple, key_def);
+				tuple_bloom_builder_add(bloom_builder, tuple,
+							key_def, hashed_parts);
+			}
 			key = tuple_extract_key(tuple, cmp_def, NULL);
-			tuple_unref(tuple);
+			if (prev_tuple != NULL)
+				tuple_unref(prev_tuple);
+			prev_tuple = tuple;
 			if (key == NULL)
 				goto close_err;
 			if (run->info.min_key == NULL) {
@@ -2562,9 +2506,13 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		info->unpacked_size = xlog_cursor_tx_pos(&cursor);
 		info->row_index_offset = page_row_index_offset;
 		++run->info.page_count;
-		run_row_count += page_row_count;
 		vy_run_acct_page(run, info);
 		region_truncate(region, mem_used);
+	}
+
+	if (prev_tuple != NULL) {
+		tuple_unref(prev_tuple);
+		prev_tuple = NULL;
 	}
 
 	if (key != NULL) {
@@ -2575,32 +2523,19 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	run->info.max_lsn = max_lsn;
 	run->info.min_lsn = min_lsn;
 
-	if (opts->bloom_fpr >= 1)
-		goto done;
-	if (xlog_cursor_reset(&cursor) != 0)
-		goto close_err;
-	if (bloom_create(&run->info.bloom, run_row_count,
-			 opts->bloom_fpr, runtime.quota) != 0) {
-		diag_set(OutOfMemory, 0,
-			 "bloom_create", "bloom");
-		goto close_err;
-	}
-	struct xrow_header xrow;
-	while ((rc = xlog_cursor_next(&cursor, &xrow, false)) == 0) {
-		if (xrow.type == VY_RUN_ROW_INDEX)
-			continue;
-
-		struct tuple *tuple = vy_stmt_decode(&xrow, cmp_def, mem_format,
-						     upsert_format, iid == 0);
-		if (tuple == NULL)
-			goto close_err;
-		bloom_add(&run->info.bloom, tuple_hash(tuple, key_def));
-	}
-	run->info.has_bloom = true;
-done:
 	region_truncate(region, mem_used);
 	run->fd = cursor.fd;
 	xlog_cursor_close(&cursor, true);
+
+	if (bloom_builder != NULL) {
+		run->info.bloom = tuple_bloom_new(bloom_builder,
+						  opts->bloom_fpr);
+		if (run->info.bloom == NULL)
+			goto close_err;
+		tuple_bloom_builder_delete(bloom_builder);
+		bloom_builder = NULL;
+	}
+
 	/* New run index is ready for write, unlink old file if exists */
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
@@ -2615,7 +2550,12 @@ done:
 close_err:
 	vy_run_clear(run);
 	region_truncate(region, mem_used);
-	xlog_cursor_close(&cursor, false);
+	if (prev_tuple != NULL)
+		tuple_unref(prev_tuple);
+	if (bloom_builder != NULL)
+		tuple_bloom_builder_delete(bloom_builder);
+	if (xlog_cursor_is_open(&cursor))
+		xlog_cursor_close(&cursor, false);
 	return -1;
 }
 
