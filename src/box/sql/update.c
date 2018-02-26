@@ -121,7 +121,6 @@ sqlite3Update(Parse * pParse,		/* The parser context */
 				 */
 	u8 *aToOpen;		/* 1 for tables and indices to be opened */
 	u8 chngPk;		/* PRIMARY KEY changed */
-	AuthContext sContext;	/* The authorization context */
 	NameContext sNC;	/* The name-context to resolve expressions in */
 	int okOnePass;		/* True for one-pass algorithm without the FIFO */
 	int hasFK;		/* True if foreign key processing is required */
@@ -147,7 +146,6 @@ sqlite3Update(Parse * pParse,		/* The parser context */
 	int regOld = 0;		/* Content of OLD.* table in triggers */
 	int regKey = 0;		/* composite PRIMARY KEY value */
 
-	memset(&sContext, 0, sizeof(sContext));
 	db = pParse->db;
 	if (pParse->nErr || db->mallocFailed) {
 		goto update_cleanup;
@@ -250,21 +248,6 @@ sqlite3Update(Parse * pParse,		/* The parser context */
 			pParse->checkSchema = 1;
 			goto update_cleanup;
 		}
-#ifndef SQLITE_OMIT_AUTHORIZATION
-		{
-			int rc;
-			rc = sqlite3AuthCheck(pParse, SQLITE_UPDATE,
-					      pTab->zName,
-					      j <
-					      0 ? "ROWID" : pTab->aCol[j].zName,
-					      db->mdb.zDbSName);
-			if (rc == SQLITE_DENY) {
-				goto update_cleanup;
-			} else if (rc == SQLITE_IGNORE) {
-				aXRef[j] = -1;
-			}
-		}
-#endif
 	}
 	assert(chngPk == 0 || chngPk == 1);
 
@@ -323,11 +306,6 @@ sqlite3Update(Parse * pParse,		/* The parser context */
 	}
 	regNew = pParse->nMem + 1;
 	pParse->nMem += pTab->nCol;
-
-	/* Start the view context. */
-	if (isView) {
-		sqlite3AuthContextPush(pParse, &sContext, pTab->zName);
-	}
 
 	/* If we are trying to update a view, realize that view into
 	 * an ephemeral table.
@@ -690,7 +668,6 @@ sqlite3Update(Parse * pParse,		/* The parser context */
 	}
 
  update_cleanup:
-	sqlite3AuthContextPop(&sContext);
 	sqlite3DbFree(db, aXRef);	/* Also frees aRegIdx[] and aToOpen[] */
 	sqlite3SrcListDelete(db, pTabList);
 	sqlite3ExprListDelete(db, pChanges);
