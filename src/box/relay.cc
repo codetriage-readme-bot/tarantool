@@ -124,6 +124,10 @@ struct relay {
 	 * confirmation from the replica.
 	 */
 	struct stailq pending_gc;
+	/**
+	 * A time when last row was send.
+	 */
+	double last_row_tstamp;
 
 	struct {
 		/* Align to prevent false-sharing with tx thread */
@@ -433,36 +437,43 @@ relay_subscribe_f(va_list ap)
 	fiber_start(reader, relay, fiber());
 
 	/*
-	 * If the replica happens to be uptodate on subscribe,
+	 * If the replica happens to be up to date on subscribe,
 	 * don't wait for timeout to happen - send a heartbeat
 	 * message right away to update the replication lag as
 	 * soon as possible.
 	 */
-	if (vclock_compare(&r->vclock, &replicaset.vclock) == 0)
-		relay_send_heartbeat(relay);
+	relay_send_heartbeat(relay);
 
 	while (!fiber_is_cancelled()) {
-		double timeout = replication_timeout;
 		struct errinj *inj = errinj(ERRINJ_RELAY_REPORT_INTERVAL,
 					    ERRINJ_DOUBLE);
 		if (inj != NULL && inj->dparam != 0)
-			timeout = inj->dparam;
+			fiber_sleep(inj->dparam);
 
-		if (fiber_cond_wait_timeout(&relay->reader_cond, timeout) != 0) {
-			/*
-			 * Timed out waiting for WAL events.
-			 * Send a heartbeat message to update
-			 * the replication lag on the slave.
-			 */
-			relay_send_heartbeat(relay);
-		}
+		double timeout = replication_timeout -
+				 (fiber_time() - relay->last_row_tstamp);
+		fiber_cond_wait_timeout(&relay->reader_cond, timeout);
 
+		struct vclock old_vclock;
+		vclock_copy(&old_vclock, &r->vclock);
 		/*
 		 * The fiber can be woken by IO cancel, by a timeout of
 		 * status messaging or by an acknowledge to status message.
 		 * Handle cbus messages first.
 		 */
 		cbus_process(&relay->endpoint);
+		/*
+		 * If the processed rows belong to the peer,
+		 * cbus_process() has filtered them out instead of
+		 * sending to the peer, so the peer got no
+		 * message. In this case we should honor the
+		 * previous heartbeat timeout, rather than reset
+		 * it.
+		 */
+		if (fiber_time() - relay->last_row_tstamp > replication_timeout) {
+			/* It is time to send a heartbeat. */
+			relay_send_heartbeat(relay);
+		}
 		/*
 		 * Check that the vclock has been updated and the previous
 		 * status message is delivered
@@ -589,5 +600,6 @@ relay_send_row(struct xstream *stream, struct xrow_header *packet)
 	if (relay->replica == NULL ||
 	    packet->replica_id != relay->replica->id) {
 		relay_send(relay, packet);
+		relay->last_row_tstamp = fiber_time();
 	}
 }
